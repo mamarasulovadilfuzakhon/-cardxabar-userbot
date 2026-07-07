@@ -12,7 +12,6 @@ load_dotenv()
 
 API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
-SESSION_NAME = os.getenv("TG_SESSION", "cardxabar_userbot")
 SESSION_STRING = os.getenv("TG_SESSION_STRING", "").strip()
 CARDXABAR_SOURCE = os.getenv("CARDXABAR_SOURCE", "").strip()
 BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
@@ -21,21 +20,25 @@ CARD_LAST4 = os.getenv("CARD_LAST4", "").strip()
 WEBHOOK_PATH = "/api/payments/cardxabar"
 
 def _sources():
-    out = []
+    names, ids = set(), set()
     for part in CARDXABAR_SOURCE.split(","):
         p = part.strip().lstrip("@")
         if not p:
             continue
-        out.append(int(p) if p.lstrip("-").isdigit() else p)
-    return out
+        if p.lstrip("-").isdigit():
+            ids.add(int(p))
+        else:
+            names.add(p.lower())
+    return names, ids
 
-_CREDIT_LINE = re.compile(r"\u2795")
-_NUMBER = re.compile(r"[0-9][0-9\s.,]*[0-9]|[0-9]")
+ALLOWED_NAMES, ALLOWED_IDS = _sources()
+_PLUS = re.compile(r"[\u2795\uFF0B+]")
+_NUMBER = re.compile(r"[0-9][0-9\s\u00a0.,]*[0-9]|[0-9]")
 
 def parse_amount_to_tiyin(text):
     credit_line = None
     for line in text.splitlines():
-        if _CREDIT_LINE.search(line):
+        if _PLUS.search(line) and any(c.isdigit() for c in line):
             credit_line = line
             break
     if credit_line is None:
@@ -56,9 +59,8 @@ def parse_amount_to_tiyin(text):
     return tiyin if tiyin > 0 else None
 
 def _post_webhook(tiyin, raw):
-    url = f"{BACKEND_URL}{WEBHOOK_PATH}"
     resp = requests.post(
-        url,
+        f"{BACKEND_URL}{WEBHOOK_PATH}",
         json={"amountTiyin": tiyin, "raw": raw},
         headers={"X-Payment-Secret": PAYMENT_SECRET, "Content-Type": "application/json"},
         timeout=15,
@@ -78,34 +80,46 @@ async def notify_backend(tiyin, raw):
     else:
         print(f"[userbot] webhook returned {status}: {text}")
 
-def _build_client():
-    if SESSION_STRING:
-        return TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-    return TelegramClient(SESSION_NAME, API_ID, API_HASH)
+async def _is_allowed(event):
+    if not ALLOWED_NAMES and not ALLOWED_IDS:
+        return True
+    try:
+        sender = await event.get_sender()
+    except Exception:
+        sender = None
+    uname = (getattr(sender, "username", None) or "").lower()
+    sid = getattr(sender, "id", None)
+    cid = getattr(event, "chat_id", None)
+    return (uname in ALLOWED_NAMES) or (sid in ALLOWED_IDS) or (cid in ALLOWED_IDS)
 
 async def main():
-    client = _build_client()
-    sources = _sources()
+    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+    await client.start()
+    me = await client.get_me()
+    print(f"[userbot] logged in as @{me.username or me.id}")
+    try:
+        await client.get_dialogs()
+        print("[userbot] chat list loaded")
+    except Exception as exc:
+        print(f"[userbot] get_dialogs warning: {exc}")
 
-    @client.on(events.NewMessage(chats=sources))
+    @client.on(events.NewMessage())
     async def handler(event):
-        text = event.raw_text or ""
-        if "\u2795" not in text:
+        if not await _is_allowed(event):
             return
+        text = event.raw_text or ""
+        print(f"[userbot] message from source: {text[:150]!r}")
         if CARD_LAST4 and CARD_LAST4 not in text:
+            print("[userbot] card last4 filter did not match; skipping")
             return
         tiyin = parse_amount_to_tiyin(text)
         if not tiyin:
-            print("[userbot] could not parse amount; skipping")
+            print("[userbot] could not parse a credit amount; skipping")
             return
         print(f"[userbot] incoming credit detected: {tiyin} tiyin")
         await notify_backend(tiyin, text)
 
-    await client.start()
-    me = await client.get_me()
-    who = f"@{me.username}" if me.username else str(me.id)
-    print(f"[userbot] logged in as {who}")
-    print(f"[userbot] listening to: {sources}")
+    print(f"[userbot] listening: names={sorted(ALLOWED_NAMES)} ids={sorted(ALLOWED_IDS)}")
     print("[userbot] ready - waiting for CardXabar payment notifications...")
     await client.run_until_disconnected()
 
