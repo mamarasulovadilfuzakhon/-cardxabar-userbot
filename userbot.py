@@ -13,10 +13,25 @@ load_dotenv()
 API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
 SESSION_STRING = os.getenv("TG_SESSION_STRING", "").strip()
+CARDXABAR_SOURCE = os.getenv("CARDXABAR_SOURCE", "").strip()
 BACKEND_URL = os.getenv("BACKEND_URL", "").rstrip("/")
 PAYMENT_SECRET = os.getenv("PAYMENT_SECRET", "")
+CARD_LAST4 = os.getenv("CARD_LAST4", "").strip()
 WEBHOOK_PATH = "/api/payments/cardxabar"
 
+def _sources():
+    names, ids = set(), set()
+    for part in CARDXABAR_SOURCE.split(","):
+        p = part.strip().lstrip("@")
+        if not p:
+            continue
+        if p.lstrip("-").isdigit():
+            ids.add(int(p))
+        else:
+            names.add(p.lower())
+    return names, ids
+
+ALLOWED_NAMES, ALLOWED_IDS = _sources()
 _PLUS = re.compile(r"[\u2795\uFF0B+]")
 _NUMBER = re.compile(r"[0-9][0-9\s\u00a0.,]*[0-9]|[0-9]")
 
@@ -52,37 +67,55 @@ def _post_webhook(tiyin, raw):
     )
     return resp.status_code, resp.text
 
+async def _is_allowed(event):
+    if not ALLOWED_NAMES and not ALLOWED_IDS:
+        return True
+    try:
+        sender = await event.get_sender()
+    except Exception:
+        sender = None
+    uname = (getattr(sender, "username", None) or "").lower()
+    sid = getattr(sender, "id", None)
+    return (uname in ALLOWED_NAMES) or (sid in ALLOWED_IDS) or (event.chat_id in ALLOWED_IDS)
+
+async def notify_backend(tiyin, raw):
+    try:
+        status, text = await asyncio.to_thread(_post_webhook, tiyin, raw)
+    except Exception as exc:
+        print(f"[userbot] webhook error: {exc}")
+        return
+    if status == 200 and '"matched":true' in text.replace(" ", ""):
+        print(f"[userbot] matched & activated: {tiyin} tiyin")
+    elif status == 200:
+        print(f"[userbot] no matching order for {tiyin} tiyin (ignored)")
+    else:
+        print(f"[userbot] webhook returned {status}: {text}")
+
 async def main():
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await client.start()
     me = await client.get_me()
-    print(f"[userbot] logged in as @{me.username or ''} (id={me.id})")
+    print(f"[userbot] logged in as @{me.username or me.id}")
     try:
         await client.get_dialogs()
+        print("[userbot] chat list loaded")
     except Exception as exc:
         print(f"[userbot] get_dialogs warning: {exc}")
-    print("[userbot] DEBUG MODE - printing EVERY incoming message")
 
     @client.on(events.NewMessage())
     async def handler(event):
-        try:
-            sender = await event.get_sender()
-        except Exception:
-            sender = None
-        uname = getattr(sender, "username", None)
-        sid = getattr(sender, "id", None)
+        if not await _is_allowed(event):
+            return
         text = event.raw_text or ""
-        print(f"[msg] chat_id={event.chat_id} sender_id={sid} username=@{uname} text={text[:120]!r}")
+        if CARD_LAST4 and CARD_LAST4 not in text:
+            return
         tiyin = parse_amount_to_tiyin(text)
-        if tiyin and _PLUS.search(text):
-            print(f"[userbot] credit detected: {tiyin} tiyin -> posting")
-            try:
-                status, resp = await asyncio.to_thread(_post_webhook, tiyin, text)
-                print(f"[userbot] webhook {status}: {resp[:200]}")
-            except Exception as exc:
-                print(f"[userbot] webhook error: {exc}")
+        if not tiyin:
+            return
+        print(f"[userbot] incoming credit: {tiyin} tiyin")
+        await notify_backend(tiyin, text)
 
-    print("[userbot] ready (DEBUG)")
+    print(f"[userbot] ready - locked to: {CARDXABAR_SOURCE}")
     await client.run_until_disconnected()
 
 if __name__ == "__main__":
